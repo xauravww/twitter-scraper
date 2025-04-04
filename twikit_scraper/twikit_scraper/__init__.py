@@ -1,0 +1,1 @@
+# This file makes the twikit_scraper directory a Python package. 
