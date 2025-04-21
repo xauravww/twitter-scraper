@@ -190,7 +190,8 @@ This project also includes a FastAPI server to expose the Twikit functionalities
 2.  **Check `.env`:** Verify your `.env` file in the project root contains the correct Twitter credentials (`TWITTER_USERNAME`, `TWITTER_EMAIL`, `TWITTER_PASSWORD`).
 3.  **Run with Uvicorn:** Navigate to the project root directory (`twikit_scraper`) in your terminal (with your virtual environment activated) and run:
     ```bash
-    uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+    python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+
     ```
     *   `--reload`: Enables auto-reload for development (server restarts on code changes).
     *   You should see output indicating the server is running on `http://127.0.0.1:8000`.
@@ -201,6 +202,22 @@ This project also includes a FastAPI server to expose the Twikit functionalities
 *   **Alternative Documentation (ReDoc):** Open your web browser and go to `http://127.0.0.1:8000/redoc`
 
 You can explore the available endpoints, see the expected request/response formats, and even try sending requests directly from the documentation interface.
+
+### Example API Endpoint: Get User Tweets
+
+One of the available endpoints might be `/users/{user_identifier}/tweets`.
+
+*   `{user_identifier}`: This is a placeholder for the Twitter User ID (e.g., `2244994945`) or the screen name (e.g., `TwitterDev`) of the user whose tweets you want to fetch. Check the `/docs` page to see exactly what identifiers are supported.
+
+*   **Example `curl` request (using screen name):**
+    ```bash
+    curl http://127.0.0.1:8000/users/TwitterDev/tweets
+    ```
+
+*   **Example `curl` request (using User ID):**
+    ```bash
+    curl http://127.0.0.1:8000/users/2244994945/tweets
+    ```
 
 ## Interactive CLI
 
