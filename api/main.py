@@ -4,75 +4,199 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union
 from datetime import datetime, date
+import urllib.parse # Needed for relogin redirect error message
+import json # Import json module
 
-from fastapi import FastAPI, HTTPException, Query, Path, Body, Depends
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Path, Body, Depends, Request, Form
+from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from twikit import Client
+# Remove specific exception imports - we will identify them at runtime
+# from twikit import TwikitError, RateLimitExceeded, AccountSuspended 
 
 # --- Configuration & Logging ---
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Environment Mode ---
+ENV_TYPE = os.environ.get('ENV_TYPE', 'dev').lower() # Default to dev
+logger.info(f"Running in ENV_TYPE: {ENV_TYPE}")
+
+# --- Template Engine (Conditional) ---
+templates: Optional[Jinja2Templates] = None
+if ENV_TYPE == 'dev':
+    templates = Jinja2Templates(directory="templates")
+
 # --- Global Twikit Client ---
-# Will be initialized during startup
 twikit_client: Optional[Client] = None
+login_error_message: Optional[str] = None # Used only in dev mode
 
 # --- Helper Functions ---
-async def initialize_twikit_client():
-    """Initializes and logs in the global Twikit client."""
-    global twikit_client
-    if twikit_client and twikit_client._logged_in_user:
-        logger.info(f"Twikit client already logged in as @{twikit_client._logged_in_user.screen_name}")
-        return
 
-    USERNAME = os.environ.get('TWITTER_USERNAME')
-    EMAIL = os.environ.get('TWITTER_EMAIL')
-    PASSWORD = os.environ.get('TWITTER_PASSWORD')
-    COOKIES_FILE = 'cookies.json' # Ensure this is writable/readable by the server process
+# Only relevant in dev mode
+async def attempt_manual_login(username: str, email: str, password: str) -> bool:
+    """
+    (Dev Mode Only) Attempts to log in using provided credentials and updates the global client.
+    Returns True on success, False on failure.
+    Stores error message in global login_error_message.
+    """
+    global twikit_client, login_error_message
+    if ENV_TYPE != 'dev':
+        logger.warning("attempt_manual_login called in non-dev mode. Ignoring.")
+        return False
 
-    if not all([USERNAME, EMAIL, PASSWORD]):
-        logger.error("TWITTER_USERNAME, TWITTER_EMAIL, or TWITTER_PASSWORD not found in .env")
-        # Decide how to handle this: raise exception, run without auth, etc.
-        # For now, we'll allow the app to start but endpoints requiring auth will fail.
-        twikit_client = None
-        return
-
-    logger.info("Initializing and logging in Twikit client...")
+    logger.info(f"Attempting manual login for user: {username} (Dev Mode)")
+    login_error_message = None # Reset error message
+    COOKIES_FILE = 'cookies.json'
     try:
-        client = Client('en-US')
-        await client.login(
-            auth_info_1=USERNAME,
-            auth_info_2=EMAIL,
-            password=PASSWORD,
-            cookies_file=COOKIES_FILE
+        temp_client = Client('en-US')
+        await temp_client.login(
+            auth_info_1=username,
+            auth_info_2=email,
+            password=password,
+            cookies_file=COOKIES_FILE # Use the same cookies file
         )
-        user_data = await client.user()
-        client._logged_in_user = user_data # Store user data
-        twikit_client = client # Assign to global variable
-        if twikit_client._logged_in_user:
-            logger.info(f"Twikit client login successful as @{twikit_client._logged_in_user.screen_name}!")
+        user_data = await temp_client.user()
+        if user_data and hasattr(user_data, 'screen_name'):
+            temp_client._logged_in_user = user_data
+            twikit_client = temp_client # Update global client
+            logger.info(f"Manual login successful for @{user_data.screen_name}! (Dev Mode)")
+            return True
         else:
-            logger.warning("Twikit client login seemed successful, but user data retrieval failed.")
-            twikit_client = None # Ensure client is None if login wasn't fully successful
+            logger.error("Manual login seemed successful, but failed to retrieve user data. (Dev Mode)")
+            login_error_message = "Login succeeded but could not verify user data."
+            twikit_client = None
+            return False
+    except EOFError as e:
+        error_msg = f"Manual login failed: {e}. Interactive input (OTP/Password) likely required and cannot be provided here. (Dev Mode)"
+        logger.error(error_msg)
+        login_error_message = error_msg
+        twikit_client = None
+        return False
     except Exception as e:
-        logger.error(f"Twikit client login failed: {e}", exc_info=True)
-        twikit_client = None # Ensure client is None on failure
+        # Log the actual exception type and message
+        logger.error(f"Manual login failed (Caught Exception Type: {type(e).__name__}): {e} (Dev Mode)", exc_info=True)
+        error_msg = f"Manual login failed ({type(e).__name__}). Check logs for details."
+        login_error_message = error_msg # Store simplified message for UI
+        twikit_client = None
+        return False
 
-# --- NEW Dependency Function ---
+async def initialize_twikit_client():
+    """Initializes the global Twikit client based on ENV_TYPE."""
+    global twikit_client, login_error_message
+    twikit_client = None # Reset
+    login_error_message = None # Reset
+
+    logger.info(f"Initializing Twikit client in {ENV_TYPE} mode...")
+
+    if ENV_TYPE == "prod":
+        # --- Production Mode: Use TWITTER_COOKIES_JSON_STRING --- 
+        cookies_json_string = os.environ.get('TWITTER_COOKIES_JSON_STRING')
+        if not cookies_json_string:
+            logger.error("[Prod Mode] TWITTER_COOKIES_JSON_STRING environment variable not set. Cannot initialize Twikit client.")
+            return
+        
+        try:
+            logger.info("[Prod Mode] Parsing cookies from TWITTER_COOKIES_JSON_STRING...")
+            parsed_data = json.loads(cookies_json_string)
+            
+            # *** NEW: Check for list containing one dictionary ***
+            if not (isinstance(parsed_data, list) and len(parsed_data) == 1 and isinstance(parsed_data[0], dict)):
+                logger.error(f"[Prod Mode] Failed to load cookies: Expected JSON format '[{{cookie_name: value, ...}}]' in TWITTER_COOKIES_JSON_STRING, but structure is different.")
+                return
+
+            # Extract the dictionary containing the cookies
+            cookies_dict = parsed_data[0]
+            logger.info(f"[Prod Mode] Extracted {len(cookies_dict)} cookies from the dictionary.")
+
+            if not cookies_dict:
+                 logger.error("[Prod Mode] No cookies found in the parsed dictionary.")
+                 return
+
+            # *** NEW: Try initializing Client directly with cookies dict ***
+            logger.info("[Prod Mode] Initializing Twikit Client with extracted cookies...")
+            # Assuming Twikit Client constructor accepts a cookies argument
+            client = Client('en-US', cookies=cookies_dict)
+            
+            # Remove the previous manual injection logic
+            # logger.info("[Prod Mode] Injecting cookies into client session from list...")
+            # ... (removed cookie jar access and iteration) ...
+
+            logger.info("[Prod Mode] Verifying cookies by fetching user data...")
+            user_data = await client.user()
+            if user_data and hasattr(user_data, 'screen_name'):
+                client._logged_in_user = user_data
+                twikit_client = client # Assign to global on success
+                logger.info(f"[Prod Mode] Twikit client initialization successful using cookies string. Logged in as @{user_data.screen_name}!")
+            else:
+                logger.error("[Prod Mode] Cookies were loaded, but failed to retrieve valid user data. Cookies might be invalid or expired.")
+        except json.JSONDecodeError as e:
+             logger.error(f"[Prod Mode] Failed to parse TWITTER_COOKIES_JSON_STRING: Invalid JSON. Error: {e}")
+        except Exception as e: # General catch for prod init
+            # Log if the Client init itself failed (e.g., if 'cookies' arg isn't supported)
+            logger.error(f"[Prod Mode] Failed to initialize/verify with cookies string (Caught Exception Type: {type(e).__name__}): {e}", exc_info=True)
+
+    else:
+        # --- Development Mode: Use Credentials & Cookies File --- 
+        USERNAME = os.environ.get('TWITTER_USERNAME')
+        EMAIL = os.environ.get('TWITTER_EMAIL')
+        PASSWORD = os.environ.get('TWITTER_PASSWORD')
+        COOKIES_FILE = 'cookies.json'
+
+        if not all([USERNAME, EMAIL, PASSWORD]):
+            logger.error("[Dev Mode] TWITTER_USERNAME, EMAIL, or PASSWORD not found in .env. Automatic login skipped.")
+            login_error_message = "Dev Mode: Credentials not found in .env for automatic login."
+            return
+        try:
+            logger.info("[Dev Mode] Attempting login with credentials/cookies...")
+            client = Client('en-US')
+            await client.login(
+                auth_info_1=USERNAME,
+                auth_info_2=EMAIL,
+                password=PASSWORD,
+                cookies_file=COOKIES_FILE
+            )
+            user_data = await client.user()
+            if user_data and hasattr(user_data, 'screen_name'):
+                client._logged_in_user = user_data
+                twikit_client = client
+                logger.info(f"[Dev Mode] Automatic login successful. Logged in as @{user_data.screen_name}!")
+            else:
+                 logger.warning("[Dev Mode] Automatic login seemed successful, but failed to retrieve user data.")
+                 login_error_message = "Dev Mode: Automatic login succeeded but could not verify user data."
+        except EOFError as e:
+            err_msg = f"[Dev Mode] Automatic login failed: {e}. Interactive input required."
+            logger.error(err_msg, exc_info=False)
+            logger.info("[Dev Mode] Server starting without logged-in client. Manual login via /login-admin may be required.")
+            login_error_message = err_msg
+        except Exception as e: # General catch for dev init
+            # Log the actual exception type and message
+            logger.error(f"[Dev Mode] Automatic login failed (Caught Exception Type: {type(e).__name__}): {e}", exc_info=True)
+            err_msg = f"Dev Mode: Automatic login failed ({type(e).__name__}). Check logs."
+            logger.info("[Dev Mode] Server starting without logged-in client. Manual login via /login-admin may be required.")
+            login_error_message = err_msg # Store simplified message for UI
+            twikit_client = None
+
+# --- Dependency Function ---
 async def get_twikit_client():
     """
     Dependency function to get the initialized Twikit client.
-    Raises HTTPException if the client is not available or logged in.
+    Raises HTTPException if the client is not available.
     """
+    global twikit_client
     if twikit_client and twikit_client._logged_in_user:
         return twikit_client
     else:
-        # Logged during initialize_twikit_client, just raise HTTP error here
-        raise HTTPException(status_code=503, detail="Twikit client not available or not logged in.")
+        logger.warning(f"Access denied to protected endpoint: Twikit client not available (Mode: {ENV_TYPE}).")
+        if ENV_TYPE == 'dev':
+            detail_msg = "Twikit client not available or not logged in. Try logging in via /login-admin."
+        else:
+            detail_msg = "Twikit client not available. Check server logs and ensure TWITTER_AUTH_TOKEN is set correctly for prod mode."
+        raise HTTPException(status_code=503, detail=detail_msg)
 
 # Function to get user ID (can now use the dependency)
 async def get_user_id_from_input(user_identifier: str, client: Client = Depends(get_twikit_client)) -> Optional[str]:
@@ -83,16 +207,18 @@ async def get_user_id_from_input(user_identifier: str, client: Client = Depends(
     else:
         try:
             screen_name = user_identifier.lstrip('@')
-            logger.info(f"Looking up user ID for screen name: @{screen_name}")
-            user_info = await client.get_user_by_screen_name(screen_name) # Use injected client
+            # logger.info(f"Looking up user ID for screen name: @{screen_name}") # Less verbose logging
+            user_info = await client.get_user_by_screen_name(screen_name)
             if user_info and hasattr(user_info, 'id'):
-                logger.info(f"Found User ID: {user_info.id}")
+                # logger.info(f"Found User ID: {user_info.id}")
                 return user_info.id
             else:
                 logger.warning(f"Could not find user or retrieve ID for screen name: @{screen_name}")
                 return None
         except Exception as e:
-            logger.error(f"Error looking up user @{screen_name}: {e}")
+            # Don't log full trace if it's likely a 404 or auth issue handled by dependency
+            log_trace = not isinstance(e, (HTTPException, TwikitError))
+            logger.error(f"Error looking up user @{screen_name}: {e}", exc_info=log_trace)
             return None
 
 # --- FastAPI Lifecycle (Startup/Shutdown) ---
@@ -109,8 +235,8 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App ---
 app = FastAPI(
     title="Twikit Scraper API",
-    description="An API to interact with Twitter using the Twikit library. Requires login credentials in a .env file.",
-    version="0.1.0",
+    description=f"An API to interact with Twitter using Twikit. Mode: {ENV_TYPE}.",
+    version="0.1.2", # Incremented version
     lifespan=lifespan
 )
 
@@ -160,16 +286,20 @@ async def root():
     return RedirectResponse(url="/docs")
 
 @app.get("/status", tags=["General"])
-async def get_status(client: Optional[Client] = Depends(get_twikit_client)): # Use dependency, allow optional for status check
-    """Checks the status of the API and Twikit client login."""
-    # Logic remains similar but uses the potentially injected client
-    if client and client._logged_in_user:
-         return {"status": "OK", "logged_in_user": client._logged_in_user.screen_name}
-    # Check global state if dependency failed (returned None implicitly before raising 503)
-    elif twikit_client:
-         return {"status": "OK", "logged_in_user": "Login incomplete"}
+async def get_status():
+    """Checks the status of the API and Twikit client initialization/login."""
+    global twikit_client, login_error_message
+    status_info = {"env_mode": ENV_TYPE}
+    if twikit_client and twikit_client._logged_in_user:
+         screen_name = getattr(twikit_client._logged_in_user, 'screen_name', 'Unknown')
+         status_info.update({"status": "OK", "twikit_ready": True, "logged_in_user": screen_name})
     else:
-         return {"status": "Error", "logged_in_user": "Client not initialized or login failed"}
+         status_info.update({"status": "Error", "twikit_ready": False, "logged_in_user": None})
+         if ENV_TYPE == 'dev':
+             status_info["last_error"] = login_error_message or "Client not initialized or login failed."
+         else:
+             status_info["detail"] = "Client not initialized. Check TWITTER_AUTH_TOKEN."
+    return status_info
 
 @app.get("/search/tweets", response_model=List[TweetData], tags=["Search & Retrieve"])
 async def search_tweets(
@@ -202,11 +332,10 @@ async def search_tweets(
         if start_date_obj or end_date_obj:
             date_range = f"from {start_date or 'beginning'} to {end_date or 'end'}"
             search_info += f" filtered {date_range}"
-        logger.info(f"Searching for {search_info}...") # Updated log
+        logger.info(f"Searching for {search_info}...")
 
-        tweets_result = await client.search_tweet(query, search_type, count=count) # Use injected client
+        tweets_result = await client.search_tweet(query, search_type, count=count)
 
-        # --- Filter and Map results --- # Updated section
         response_data = []
         filtered_count = 0
         for tweet in tweets_result:
@@ -247,11 +376,14 @@ async def search_tweets(
                 ) if user_data else None
             ))
 
-        logger.info(f"Found {len(response_data)} tweets matching criteria ({filtered_count} tweets filtered out by date)." ) # Updated log
+        logger.info(f"Found {len(response_data)} tweets matching criteria ({filtered_count} tweets filtered out by date).")
         return response_data
     except Exception as e:
         logger.error(f"Error during tweet search: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error during tweet search: {e}")
+        if isinstance(e, HTTPException):
+             raise e # Re-raise HTTP exceptions (like 503 from dependency)
+        # Assume other errors are internal server errors
+        raise HTTPException(status_code=500, detail=f"Internal server error during tweet search: {str(e)}")
 
 @app.get("/users/{user_identifier}/tweets", response_model=List[TweetData], tags=["Search & Retrieve"])
 async def get_user_tweets(
@@ -323,19 +455,16 @@ async def get_user_tweets(
              logger.info(f"Finished processing due to iteration error. Returning {len(response_data)} mapped tweets for user ID {user_id}.")
 
         return response_data
-    except twikit.errors.AccountSuspended as e:
-        # Check if the suspension is due to a rate limit (status 429)
-        if e.response and e.response.status_code == 429:
-            logger.warning(f"Twitter API rate limit exceeded for user ID {user_id}: {e}")
-            raise HTTPException(status_code=429, detail=f"Twitter API rate limit exceeded. Please try again later. Details: {e.message}")
-        else:
-            # If it's another AccountSuspended reason, treat as 500 or other appropriate error
-            logger.error(f"Account suspended or other critical error for user ID {user_id}: {e}", exc_info=True)
-            raise HTTPException(status_code=503, detail=f"Account issue encountered: {e.message}") # 503 Service Unavailable might be suitable
     except Exception as e:
-        logger.error(f"Error during get_user_tweets execution for ID {user_id}: {e}", exc_info=True)
-        # Avoid raising 500 if it's a known "not found" type error from twikit, if possible
-        raise HTTPException(status_code=500, detail=f"Internal server error fetching user tweets: {e}")
+        # Log the actual exception type
+        logger.error(f"Error during get_user_tweets for ID {user_id} (Caught Exception Type: {type(e).__name__}): {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+             raise e # Re-raise HTTP exceptions (like 503 from dependency)
+        # Check if it looks like a rate limit error based on message (heuristic)
+        if "rate limit" in str(e).lower() or "429" in str(e):
+             raise HTTPException(status_code=429, detail=f"Rate limit likely exceeded. Details: {str(e)}")
+        # General internal server error for others
+        raise HTTPException(status_code=500, detail=f"Internal server error fetching user tweets: {str(e)}")
 
 @app.get("/trends", response_model=List[TrendData], tags=["Search & Retrieve"])
 async def get_trends(
@@ -422,11 +551,152 @@ async def get_user_id_by_screen_name(
         # Improve error message based on potential twikit exception types if known
         raise HTTPException(status_code=404, detail=f"Could not retrieve user ID for '{screen_name}'. Reason: {e}")
 
-# --- Uvicorn Runner (for direct execution) ---
+# --- Dev Mode Only: Login Admin UI Endpoint ---
+@app.get("/login-admin", response_class=HTMLResponse, tags=["Admin"], include_in_schema=(ENV_TYPE == 'dev'))
+async def login_admin_ui(request: Request):
+    """(Dev Mode Only) Serves the HTML page for manual login."""
+    if ENV_TYPE != 'dev':
+        raise HTTPException(status_code=404, detail="Login admin UI is only available in dev mode.")
+    if not templates:
+         raise HTTPException(status_code=500, detail="Templates not initialized for dev mode.")
+
+    global twikit_client, login_error_message
+    logged_in = False
+    username = None
+    if twikit_client and twikit_client._logged_in_user:
+        logged_in = True
+        username = getattr(twikit_client._logged_in_user, 'screen_name', 'Unknown')
+
+    env_username = os.environ.get('TWITTER_USERNAME', '')
+    env_email = os.environ.get('TWITTER_EMAIL', '')
+
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "logged_in": logged_in,
+        "username": username,
+        "last_error": login_error_message,
+        "env_username": env_username,
+        "env_email": env_email
+    })
+
+# --- Dev Mode Only: Re-Login Endpoint ---
+@app.post("/relogin", tags=["Admin"], status_code=303, include_in_schema=(ENV_TYPE == 'dev'))
+async def relogin(
+    username: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...)
+):
+    """(Dev Mode Only) Attempts to manually log in the global Twikit client."""
+    if ENV_TYPE != 'dev':
+         raise HTTPException(status_code=404, detail="Relogin functionality is only available in dev mode.")
+
+    global twikit_client, login_error_message
+    if twikit_client and twikit_client._logged_in_user:
+        logger.warning("Relogin attempt rejected: Client already logged in. (Dev Mode)")
+        return RedirectResponse("/login-admin?message=Already+logged+in", status_code=303)
+
+    success = await attempt_manual_login(username, email, password)
+
+    if success:
+        logger.info("Manual relogin successful, redirecting. (Dev Mode)")
+        login_error_message = None # Clear error on success
+        return RedirectResponse("/login-admin?message=Login+Successful", status_code=303)
+    else:
+        logger.error(f"Manual relogin failed. Error: {login_error_message} (Dev Mode)")
+        error_param = urllib.parse.quote(login_error_message or 'Login failed, check logs.')
+        return RedirectResponse(f"/login-admin?error={error_param}", status_code=303)
+
+# --- Uvicorn Runner (Conditional Template Creation) ---
 if __name__ == "__main__":
     import uvicorn
+
+    # Only create templates in dev mode
+    if ENV_TYPE == 'dev':
+        if not os.path.exists("templates"):
+            os.makedirs("templates")
+            logger.info("Created 'templates' directory for dev mode.")
+
+        login_html_path = os.path.join("templates", "login.html")
+        if not os.path.exists(login_html_path):
+            logger.info(f"Creating basic '{login_html_path}' file for dev mode.")
+            # (Use the same basic_html content from previous step)
+            basic_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Twikit Login Admin</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .container { max-width: 600px; margin: auto; }
+        .message { border: 1px solid; padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+        .error { color: #721c24; background-color: #f8d7da; border-color: #f5c6cb; }
+        .success { color: #155724; background-color: #d4edda; border-color: #c3e6cb; }
+        .status { border: 1px solid #ccc; padding: 10px; margin-bottom: 15px; background-color: #f9f9f9; border-radius: 4px;}
+        .status strong { display: inline-block; min-width: 60px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type=text], input[type=password], input[type=email] {
+            width: calc(100% - 18px); /* Adjust for padding */
+            padding: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        button { padding: 10px 15px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; font-size: 1em; }
+        button:hover { background-color: #0056b3; }
+        h1, h2 { border-bottom: 1px solid #eee; padding-bottom: 5px; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Twikit API Login Status</h1>
+
+        <div class="status">
+            <strong>Mode:</strong> {{ env_mode }} <br>
+            <strong>Status:</strong>
+            {% if logged_in %}
+                <span style="color: green; font-weight: bold;">Logged In</span> as <strong>@{{ username }}</strong>
+            {% else %}
+                <span style="color: red; font-weight: bold;">Not Logged In</span>
+            {% endif %}
+        </div>
+
+        {# Display feedback messages from redirects or persistent errors #}
+        {% set error_msg = request.query_params.get('error') %}
+        {% set success_msg = request.query_params.get('message') %}
+        {% if error_msg %}
+            <div class="message error">Login Failed: {{ error_msg }}</div>
+        {% elif success_msg %}
+             <div class="message success">{{ success_msg }}</div>
+        {% elif last_error %}
+             <div class="message error">Last Login Attempt Error: {{ last_error }}</div>
+        {% endif %}
+
+
+        {% if not logged_in %}
+            <h2>Manual Login</h2>
+            <p>If automatic login failed (check server logs), enter credentials below and click Login.</p>
+            <form action="/relogin" method="post">
+                <div>
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" value="{{ env_username }}" required>
+                </div>
+                <div>
+                    <label for="email">Email:</label>
+                    <input type="email" id="email" name="email" value="{{ env_email }}" required>
+                </div>
+                <div>
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Login</button>
+            </form>
+        {% endif %}
+    </div>
+</body>
+</html>
+            """
+            with open(login_html_path, "w", encoding='utf-8') as f:
+                f.write(basic_html)
+
     logger.info("Starting Uvicorn server directly...")
-    # Make sure .env is in the root directory when running this way
-    # Use reload=True only for development
-    # Bind to 0.0.0.0 to make accessible on the network
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info") 

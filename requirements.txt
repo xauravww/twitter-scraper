@@ -4,3 +4,5 @@ rich
 fastapi
 uvicorn[standard] 
 requests 
+jinja2
+python-multipart 
