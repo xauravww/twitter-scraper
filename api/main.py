@@ -14,8 +14,8 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from twikit import Client
-# Remove specific exception imports - we will identify them at runtime
-# from twikit import TwikitError, RateLimitExceeded, AccountSuspended 
+# Restore specific NotFound import, as identified in logs
+from twikit.errors import NotFound # Removed others for now, add back if needed
 
 # --- Configuration & Logging ---
 load_dotenv()
@@ -127,17 +127,27 @@ async def initialize_twikit_client():
             # ... (removed cookie jar access and iteration) ...
 
             logger.info("[Prod Mode] Verifying cookies by fetching user data...")
-            user_data = await client.user()
+            # *** Add specific catch for NotFound during verification ***
+            try:
+                user_data = await client.user()
+            except NotFound as e:
+                 logger.error(f"[Prod Mode] Verification failed: twikit received 404 calling internal endpoint ({e}). This might indicate invalid cookies OR an API change in Twitter/X affecting twikit.")
+                 # Set client to None and return, preventing assignment to global
+                 client = None 
+                 user_data = None # Ensure user_data is None
+                 # We don't re-raise here, just log and prevent global assignment
+
             if user_data and hasattr(user_data, 'screen_name'):
                 client._logged_in_user = user_data
                 twikit_client = client # Assign to global on success
                 logger.info(f"[Prod Mode] Twikit client initialization successful using cookies string. Logged in as @{user_data.screen_name}!")
-            else:
+            elif client is not None: # Only log error if NotFound wasn't the issue
                 logger.error("[Prod Mode] Cookies were loaded, but failed to retrieve valid user data. Cookies might be invalid or expired.")
+            # If client is None (due to NotFound), the failure is already logged.
+
         except json.JSONDecodeError as e:
              logger.error(f"[Prod Mode] Failed to parse TWITTER_COOKIES_JSON_STRING: Invalid JSON. Error: {e}")
-        except Exception as e: # General catch for prod init
-            # Log if the Client init itself failed (e.g., if 'cookies' arg isn't supported)
+        except Exception as e: # General catch for other prod init errors (like Client init itself)
             logger.error(f"[Prod Mode] Failed to initialize/verify with cookies string (Caught Exception Type: {type(e).__name__}): {e}", exc_info=True)
 
     else:
