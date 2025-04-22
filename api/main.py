@@ -428,4 +428,5 @@ if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
     # Make sure .env is in the root directory when running this way
     # Use reload=True only for development
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, log_level="info") 
+    # Bind to 0.0.0.0 to make accessible on the network
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info") 
