@@ -148,6 +148,12 @@ class UserIdResponse(BaseModel):
 
 # --- API Endpoints ---
 
+@app.get("/health", tags=["General"])
+async def health_check():
+    """Simple health check endpoint."""
+    # This endpoint can be expanded later to check database connections, etc.
+    return {"status": "healthy"}
+
 @app.get("/", include_in_schema=False)
 async def root():
     """Redirects to the API documentation."""

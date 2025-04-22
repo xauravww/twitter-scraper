@@ -3,3 +3,4 @@ python-dotenv
 rich 
 fastapi
 uvicorn[standard] 
+requests 
