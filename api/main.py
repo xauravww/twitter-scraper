@@ -262,6 +262,8 @@ class TweetData(BaseModel):
     text: Optional[str] = None
     created_at: Optional[str] = None
     user: Optional[TweetUser] = None
+    tweet_url: Optional[str] = None # Added tweet URL
+    media_urls: List[str] = [] # Added list for media URLs (defaults to empty)
     # Add other relevant fields from twikit Tweet object as needed
 
 class TrendData(BaseModel):
@@ -375,15 +377,69 @@ async def search_tweets(
 
             # Map to Pydantic model if within date range
             user_data = getattr(tweet, 'user', None)
+            tweet_id = getattr(tweet, 'id', None)
+            screen_name = getattr(user_data, 'screen_name', None) if user_data else None
+
+            # Construct tweet URL
+            tweet_url = None
+            if tweet_id and screen_name:
+                tweet_url = f"https://twitter.com/{screen_name}/status/{tweet_id}"
+
+            # Extract media URLs with specific logic for type
+            media_urls = []
+            # Try extended_entities first, then media, default to empty list
+            media_list = []
+            extended_entities = getattr(tweet, 'extended_entities', None)
+            if extended_entities and isinstance(extended_entities, dict):
+                media_list = extended_entities.get('media', [])
+            if not media_list: # Fallback to primary media attribute if extended not found
+                media_list = getattr(tweet, 'media', [])
+            
+            if isinstance(media_list, list):
+                for media_item in media_list:
+                    media_type = getattr(media_item, 'type', None)
+                    
+                    if media_type in ['photo', 'animated_gif']:
+                        url = getattr(media_item, 'media_url_https', None)
+                        if url and isinstance(url, str):
+                            media_urls.append(url)
+                            
+                    elif media_type == 'video':
+                        video_info = getattr(media_item, 'video_info', None)
+                        if video_info and isinstance(video_info, dict):
+                            variants = video_info.get('variants', [])
+                            if isinstance(variants, list):
+                                best_url = None
+                                max_bitrate = -1
+                                for variant in variants:
+                                    if isinstance(variant, dict) and variant.get('content_type') == 'video/mp4':
+                                        bitrate = variant.get('bitrate', 0)
+                                        variant_url = variant.get('url')
+                                        try:
+                                            current_bitrate = int(bitrate)
+                                        except (ValueError, TypeError):
+                                            current_bitrate = 0
+                                            
+                                        if variant_url and current_bitrate >= max_bitrate:
+                                            max_bitrate = current_bitrate
+                                            best_url = variant_url
+                                            
+                                if best_url and isinstance(best_url, str):
+                                    media_urls.append(best_url)
+                                # Optionally add fallback for non-mp4 video? (Currently disabled)
+                                # elif variants: ... 
+
             response_data.append(TweetData(
-                id=getattr(tweet, 'id', None),
+                id=tweet_id,
                 text=getattr(tweet, 'text', None),
-                created_at=str(tweet_created_at_str), # Keep original string format for response
+                created_at=str(tweet_created_at_str),
                 user=TweetUser(
                     id=getattr(user_data, 'id', None),
                     name=getattr(user_data, 'name', None),
-                    screen_name=getattr(user_data, 'screen_name', None)
-                ) if user_data else None
+                    screen_name=screen_name
+                ) if user_data else None,
+                tweet_url=tweet_url, # Assign constructed URL
+                media_urls=media_urls # Assign extracted media URLs
             ))
 
         logger.info(f"Found {len(response_data)} tweets matching criteria ({filtered_count} tweets filtered out by date).")
@@ -440,16 +496,71 @@ async def get_user_tweets(
             for i, tweet in enumerate(tweets_iterable):
                 # logger.debug(f"Processing item {i}: Type={type(tweet)}") # Log inside loop
                 user_data = getattr(tweet, 'user', None)
+                tweet_id = getattr(tweet, 'id', None)
+                screen_name = getattr(user_data, 'screen_name', None) if user_data else None
+                tweet_created_at_str = getattr(tweet, 'created_at', None)
+
+                # Construct tweet URL
+                tweet_url = None
+                if tweet_id and screen_name:
+                    tweet_url = f"https://twitter.com/{screen_name}/status/{tweet_id}"
+
+                # Extract media URLs with specific logic for type
+                media_urls = []
+                # Try extended_entities first, then media, default to empty list
+                media_list = []
+                extended_entities = getattr(tweet, 'extended_entities', None)
+                if extended_entities and isinstance(extended_entities, dict):
+                    media_list = extended_entities.get('media', [])
+                if not media_list: # Fallback to primary media attribute if extended not found
+                    media_list = getattr(tweet, 'media', [])
+
+                if isinstance(media_list, list):
+                    for media_item in media_list:
+                        media_type = getattr(media_item, 'type', None)
+                        
+                        if media_type in ['photo', 'animated_gif']:
+                            url = getattr(media_item, 'media_url_https', None)
+                            if url and isinstance(url, str):
+                                media_urls.append(url)
+                                
+                        elif media_type == 'video':
+                            video_info = getattr(media_item, 'video_info', None)
+                            if video_info and isinstance(video_info, dict):
+                                variants = video_info.get('variants', [])
+                                if isinstance(variants, list):
+                                    best_url = None
+                                    max_bitrate = -1
+                                    for variant in variants:
+                                        if isinstance(variant, dict) and variant.get('content_type') == 'video/mp4':
+                                            bitrate = variant.get('bitrate', 0)
+                                            variant_url = variant.get('url')
+                                            try:
+                                                current_bitrate = int(bitrate)
+                                            except (ValueError, TypeError):
+                                                current_bitrate = 0
+                                                
+                                            if variant_url and current_bitrate >= max_bitrate:
+                                                max_bitrate = current_bitrate
+                                                best_url = variant_url
+                                                
+                                    if best_url and isinstance(best_url, str):
+                                        media_urls.append(best_url)
+                                    # Optionally add fallback for non-mp4 video? (Currently disabled)
+                                    # elif variants: ... 
+
                 try:
                     mapped_tweet = TweetData(
-                        id=getattr(tweet, 'id', None),
+                        id=tweet_id,
                         text=getattr(tweet, 'text', None),
-                        created_at=str(getattr(tweet, 'created_at', None)),
+                        created_at=str(tweet_created_at_str),
                         user=TweetUser(
                             id=getattr(user_data, 'id', None),
                             name=getattr(user_data, 'name', None),
-                            screen_name=getattr(user_data, 'screen_name', None)
-                        ) if user_data else None
+                            screen_name=screen_name
+                        ) if user_data else None,
+                        tweet_url=tweet_url, # Assign constructed URL
+                        media_urls=media_urls # Assign extracted media URLs
                     )
                     response_data.append(mapped_tweet)
                     processed_count += 1
