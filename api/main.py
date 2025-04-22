@@ -3,6 +3,7 @@ import os
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional, Union
+from datetime import datetime, date
 
 from fastapi import FastAPI, HTTPException, Query, Path, Body, Depends
 from fastapi.responses import RedirectResponse
@@ -169,28 +170,78 @@ async def search_tweets(
     query: str = Query(..., description="The search query string."),
     search_type: str = Query("Latest", enum=["Latest", "Top", "Media"], description="Type of search results."),
     count: int = Query(20, ge=1, le=100, description="Number of tweets to retrieve."),
+    start_date: Optional[str] = Query(None, description="Start date for filtering (YYYY-MM-DD)", regex="^\\d{4}-\\d{2}-\\d{2}$"),
+    end_date: Optional[str] = Query(None, description="End date for filtering (YYYY-MM-DD)", regex="^\\d{4}-\\d{2}-\\d{2}$"),
     client: Client = Depends(get_twikit_client) # Use dependency
 ):
-    """Searches for tweets based on a query."""
+    """Searches for tweets based on a query, optionally filtering by date."""
+    # --- Parse dates ---
+    start_date_obj: Optional[date] = None
+    end_date_obj: Optional[date] = None
+    try:
+        if start_date:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+        if end_date:
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Please use YYYY-MM-DD.")
+
+    # Ensure start_date is not after end_date if both are provided
+    if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date.")
+
     # Remove: if not twikit_client: ... (dependency handles this)
     try:
-        logger.info(f"Searching for '{search_type}' tweets matching '{query}' (count={count})...")
+        search_info = f"'{search_type}' tweets matching '{query}' (count={count})"
+        if start_date_obj or end_date_obj:
+            date_range = f"from {start_date or 'beginning'} to {end_date or 'end'}"
+            search_info += f" filtered {date_range}"
+        logger.info(f"Searching for {search_info}...") # Updated log
+
         tweets_result = await client.search_tweet(query, search_type, count=count) # Use injected client
-        # Manually map results to Pydantic model if necessary, or rely on FastAPI if structure matches
-        # For safety, let's assume manual mapping might be needed if fields differ slightly
+
+        # --- Filter and Map results --- # Updated section
         response_data = []
+        filtered_count = 0
         for tweet in tweets_result:
-             user_data = getattr(tweet, 'user', None)
-             response_data.append(TweetData(
-                 id=getattr(tweet, 'id', None),
-                 text=getattr(tweet, 'text', None),
-                 created_at=str(getattr(tweet, 'created_at', None)),
-                 user=TweetUser(
-                     id=getattr(user_data, 'id', None),
-                     name=getattr(user_data, 'name', None),
-                     screen_name=getattr(user_data, 'screen_name', None)
-                 ) if user_data else None
-             ))
+            tweet_created_at_str = getattr(tweet, 'created_at', None)
+            if not tweet_created_at_str:
+                continue # Skip if no date
+
+            try:
+                # Parse the Twitter date string (e.g., "Mon Apr 21 21:53:41 +0000 2025")
+                # Ensure the object from twikit is datetime, if not, parse string
+                if isinstance(tweet_created_at_str, datetime):
+                    tweet_dt = tweet_created_at_str
+                else:
+                    tweet_dt = datetime.strptime(str(tweet_created_at_str), "%a %b %d %H:%M:%S %z %Y")
+                tweet_date = tweet_dt.date()
+            except (ValueError, TypeError) as parse_error:
+                logger.warning(f"Could not parse tweet created_at '{tweet_created_at_str}': {parse_error}. Skipping tweet ID {getattr(tweet, 'id', 'N/A')}")
+                continue # Skip tweet if date is unparseable
+
+            # Apply date filtering
+            if start_date_obj and tweet_date < start_date_obj:
+                filtered_count += 1
+                continue # Skip tweet if before start date
+            if end_date_obj and tweet_date > end_date_obj:
+                filtered_count += 1
+                continue # Skip tweet if after end date
+
+            # Map to Pydantic model if within date range
+            user_data = getattr(tweet, 'user', None)
+            response_data.append(TweetData(
+                id=getattr(tweet, 'id', None),
+                text=getattr(tweet, 'text', None),
+                created_at=str(tweet_created_at_str), # Keep original string format for response
+                user=TweetUser(
+                    id=getattr(user_data, 'id', None),
+                    name=getattr(user_data, 'name', None),
+                    screen_name=getattr(user_data, 'screen_name', None)
+                ) if user_data else None
+            ))
+
+        logger.info(f"Found {len(response_data)} tweets matching criteria ({filtered_count} tweets filtered out by date)." ) # Updated log
         return response_data
     except Exception as e:
         logger.error(f"Error during tweet search: {e}", exc_info=True)
@@ -266,6 +317,15 @@ async def get_user_tweets(
              logger.info(f"Finished processing due to iteration error. Returning {len(response_data)} mapped tweets for user ID {user_id}.")
 
         return response_data
+    except twikit.errors.AccountSuspended as e:
+        # Check if the suspension is due to a rate limit (status 429)
+        if e.response and e.response.status_code == 429:
+            logger.warning(f"Twitter API rate limit exceeded for user ID {user_id}: {e}")
+            raise HTTPException(status_code=429, detail=f"Twitter API rate limit exceeded. Please try again later. Details: {e.message}")
+        else:
+            # If it's another AccountSuspended reason, treat as 500 or other appropriate error
+            logger.error(f"Account suspended or other critical error for user ID {user_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail=f"Account issue encountered: {e.message}") # 503 Service Unavailable might be suitable
     except Exception as e:
         logger.error(f"Error during get_user_tweets execution for ID {user_id}: {e}", exc_info=True)
         # Avoid raising 500 if it's a known "not found" type error from twikit, if possible
